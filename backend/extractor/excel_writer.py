@@ -99,7 +99,8 @@ class ExcelWriter:
 
         # ── Title row ─────────────────────────────────────────────────────
         if table.title:
-            ws.cell(row=current_row, column=1, value=table.title)
+            title_val = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', table.title)
+            ws.cell(row=current_row, column=1, value=title_val)
             ws.cell(row=current_row, column=1).font = _TITLE_FONT
             ws.cell(row=current_row, column=1).alignment = _LEFT
 
@@ -118,6 +119,8 @@ class ExcelWriter:
         header_start_row = current_row
         for header_row in table.headers:
             for col_idx, cell_value in enumerate(header_row):
+                if isinstance(cell_value, str):
+                    cell_value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cell_value)
                 cell = ws.cell(row=current_row, column=col_idx + 1, value=cell_value)
                 cell.font = _HEADER_FONT
                 cell.fill = _HEADER_FILL
@@ -126,7 +129,12 @@ class ExcelWriter:
             current_row += 1
 
         # ── Apply merge regions (offset by header_start_row) ──────────────
-        for merge in table.merge_regions:
+        safe_merges = self._sanitize_merge_regions(
+            table.merge_regions,
+            header_rows=len(table.headers),
+            total_cols=table.total_cols,
+        )
+        for merge in safe_merges:
             try:
                 start_r = header_start_row + merge.start_row
                 start_c = merge.start_col + 1
@@ -177,6 +185,10 @@ class ExcelWriter:
                 else:
                     cell.font = _DATA_FONT
 
+                # Strip illegal XML control characters before writing
+                if isinstance(cell_value, str):
+                    cell_value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cell_value)
+
                 # Try to write as a number for Excel compatibility
                 numeric = self._try_parse_number(cell_value)
                 if numeric is not None:
@@ -205,6 +217,58 @@ class ExcelWriter:
 
             col_letter = get_column_letter(col_idx + 1)
             ws.column_dimensions[col_letter].width = max_len
+
+    @staticmethod
+    def _sanitize_merge_regions(merges, header_rows: int, total_cols: int):
+        """
+        Keep only valid, in-header, non-overlapping merge regions.
+        This prevents overlapping/invalid header merges from corrupting layout.
+        """
+        valid = []
+        seen = set()
+
+        for m in merges:
+            if m.start_row < 0 or m.start_col < 0:
+                continue
+            if m.end_row < m.start_row or m.end_col < m.start_col:
+                continue
+            if m.end_row >= header_rows or m.end_col >= total_cols:
+                continue
+            # Skip single-cell "merges"
+            if m.start_row == m.end_row and m.start_col == m.end_col:
+                continue
+
+            key = (m.start_row, m.start_col, m.end_row, m.end_col)
+            if key in seen:
+                continue
+            seen.add(key)
+            valid.append(m)
+
+        # Sort by area desc then top-left asc so larger parent merges win.
+        valid.sort(
+            key=lambda x: (
+                -((x.end_row - x.start_row + 1) * (x.end_col - x.start_col + 1)),
+                x.start_row,
+                x.start_col,
+            )
+        )
+
+        accepted = []
+
+        def _overlap(a, b):
+            return not (
+                a.end_row < b.start_row
+                or b.end_row < a.start_row
+                or a.end_col < b.start_col
+                or b.end_col < a.start_col
+            )
+
+        for cand in valid:
+            if any(_overlap(cand, ex) for ex in accepted):
+                continue
+            accepted.append(cand)
+
+        return accepted
 
     @staticmethod
     def _unique_sheet_name(title: str, index: int, used: set[str]) -> str:
@@ -248,7 +312,8 @@ class ExcelWriter:
         if cleaned.startswith("(") and cleaned.endswith(")"):
             cleaned = "-" + cleaned[1:-1]
 
-        # Handle percentage — store as the visible value (e.g. 12.5, not 0.125)
+        # Handle percentage — store as decimal (e.g. 53% → 0.53) so Excel
+        # format "0.00%" displays correctly (Excel multiplies by 100 for display)
         is_percent = False
         if cleaned.endswith("%"):
             cleaned = cleaned[:-1].strip()
@@ -260,8 +325,10 @@ class ExcelWriter:
 
         try:
             val = float(cleaned)
+            if is_percent:
+                return val / 100.0
             # Return as int if it's a whole number and the original didn't have decimals
-            if not is_percent and val == int(val) and "." not in text:
+            if val == int(val) and "." not in text:
                 return int(val)
             return val
         except ValueError:

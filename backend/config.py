@@ -15,7 +15,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Upload limits ─────────────────────────────────────────────────────────
-MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_MB = 200
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf"}
 

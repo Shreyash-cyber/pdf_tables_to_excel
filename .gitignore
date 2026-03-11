@@ -131,6 +131,7 @@ outputs/
 *.xlsx
 *.txt
 !requirements.txt
+!README.md
 *.log
 tmp_*.py
 debug_*.py
@@ -139,4 +140,9 @@ check_*.py
 trace_*.py
 eval_*.txt
 *.webp
+*.png
 logo_b64.txt
+
+# OS files
+Thumbs.db
+.DS_Store

@@ -34,19 +34,155 @@ class TableReconstructor:
             if table.is_empty:
                 continue
             table = deepcopy(table)
+            table = self._fix_garbled_headers(table)
             table = self._fix_corrupted_numbers(table)
-            table = self._realign_misplaced_schedule_data(table)
             table = self._split_merged_columns(table)
             table = self._realign_displaced_columns(table)
             table = self._split_numeric_data_columns(table)
+            table = self._redistribute_schedule_numeric_blobs(table)
             table = self._expand_multiline_cells(table)
+            table = self._merge_continuation_rows(table)
+            table = self._stitch_rows_if_needed(table)
             table = self._detect_headers(table)
-            table = self._strip_empty_columns(table)
-            table = self._stitch_rows(table)
-            table = self._deduplicate_rows(table)
+            # Stitching/header detection can reintroduce schedule-column blobs
+            # on some insurer formats, so normalize once more on final rows.
+            table = self._redistribute_schedule_numeric_blobs(table)
+            table = self._final_schedule_cleanup(table)
             table = self._detect_merge_regions(table)
             result.append(table)
         return result
+
+    @staticmethod
+    def _final_schedule_cleanup(table: TableData) -> TableData:
+        """
+        Last-pass cleanup for schedule-like tables:
+        - clear numeric/text blobs from Schedule column
+        - push parsed numeric tokens into data columns
+        - keep only true ref codes (L-4, L-5, ...) in Schedule.
+        """
+        if not table.rows:
+            return table
+
+        ref_code = re.compile(r'^[A-Z]+-?\d+$')
+        token_pattern = re.compile(
+            r'\(\s*[0-9][0-9,. ]*\s*\)'
+            r'|[0-9][0-9,.]*'
+            r'|-(?=\s|$)'
+        )
+
+        # Infer schedule column from headers and ref-code distribution.
+        schedule_col = -1
+        for hrow in table.headers[:8]:
+            for ci, c in enumerate(hrow):
+                up = str(c).upper().strip()
+                if "SCHEDULE" in up or "REF" in up:
+                    schedule_col = ci
+                    break
+            if schedule_col >= 0:
+                break
+
+        max_cols = max(len(r) for r in table.rows)
+        probe_cols = min(max_cols, 5)
+        ref_hits_by_col = [0] * probe_cols
+        for r in table.rows[:120]:
+            for ci in range(probe_cols):
+                if ci < len(r) and ref_code.match(str(r[ci]).strip()):
+                    ref_hits_by_col[ci] += 1
+
+        if ref_hits_by_col:
+            best_col = max(range(probe_cols), key=lambda c: ref_hits_by_col[c])
+            if ref_hits_by_col[best_col] >= 2:
+                schedule_col = best_col
+
+        if schedule_col < 0 and max_cols > 1:
+            schedule_col = 1
+        if schedule_col == 0 and max_cols > 1:
+            schedule_col = 1
+        if schedule_col < 0:
+            return table
+
+        for row in table.rows:
+            if len(row) <= schedule_col:
+                continue
+            s = str(row[schedule_col]).strip()
+            if not s or ref_code.match(s):
+                continue
+
+            matches = list(token_pattern.finditer(s))
+            tokens = [m.group(0).replace(' ', '') for m in matches]
+
+            if len(tokens) >= 3:
+                label_part = s[:matches[0].start()].strip() if matches else ""
+                cur_label = str(row[0]).strip() if row else ""
+                if label_part and (not cur_label or cur_label == s):
+                    row[0] = label_part
+
+                start = schedule_col + 1
+                for i, tok in enumerate(_merge_split_numbers(tokens)):
+                    ci = start + i
+                    if ci >= len(row):
+                        break
+                    cur = str(row[ci]).strip()
+                    if not cur or cur == tok:
+                        row[ci] = tok
+
+                row[schedule_col] = ""
+            else:
+                # Pure text in schedule: move/clear if it's duplicated label text.
+                cur_label = str(row[0]).strip() if row else ""
+                if not cur_label:
+                    row[0] = s
+                    row[schedule_col] = ""
+                elif cur_label == s:
+                    row[schedule_col] = ""
+
+        return table
+
+    def _stitch_rows_if_needed(self, table: TableData) -> TableData:
+        """
+        Apply row stitching only when we detect strong label/data displacement.
+        This avoids touching already well-aligned tables.
+        
+        However, we skip stitching if the table contains:
+        - Section headers (labels followed by sub-item markers like (a), (b))
+        - Sub-item labels (patterns like (a), (b), (i), (ii))
+        
+        These tables are usually already well-structured and stitching would break them.
+        """
+        if not table.rows:
+            return table
+
+        # Check if table has section/sub-item structure
+        has_section_structure = False
+        for i, row in enumerate(table.rows):
+            lbl = ' '.join(str(c).strip() for c in row[0:2]).strip()
+            if not lbl:
+                continue
+            # Check if this row is a sub-item marker
+            is_subitem = bool(re.match(r'^(\(?[a-z]\)|\d+\.|\(?[ivx]+\))', lbl, re.IGNORECASE))
+            # If we find a sub-item marker, assume table has section structure
+            if is_subitem:
+                has_section_structure = True
+                break
+        
+        # If table has section/sub-item structure, don't stitch
+        if has_section_structure:
+            return table
+
+        label_only = 0
+        data_only = 0
+        for row in table.rows:
+            has_label = any(str(c).strip() for c in row[0:2])
+            has_data = any(str(c).strip() for c in row[2:])
+            if has_label and not has_data:
+                label_only += 1
+            elif has_data and not has_label:
+                data_only += 1
+
+        # Trigger only for clear displacement patterns.
+        if label_only >= 3 and data_only >= 3:
+            return self._stitch_rows(table)
+        return table
 
     def _stitch_rows(self, table: TableData) -> TableData:
         """
@@ -62,19 +198,40 @@ class TableReconstructor:
             'UNIT LINKED', 'PARTICIPATING', 'NON PARTICIPATING',
         }
 
-        def _is_section_header(idx: int, lblock: list[list[str]]) -> bool:
+        def _is_section_header(idx: int, lblock: list[list[str]], all_rows: list[list[str]], lblock_start: int) -> bool:
+            """
+            Detect if a row is a section header (should NOT be stitched with data).
+            Section headers are rows that:
+            - Are not list markers like (a), (b), (i), (ii)
+            - Have list-marked sub-items following
+            - May have section keywords
+            """
             lbl = ' '.join(str(c).strip() for c in lblock[idx][0:2]).strip()
+            
+            # Check for explicit section keywords
             if any(kw in lbl.upper() for kw in _section_keywords):
                 return True
+            
             if lbl.endswith(':'):
                 return True
-            # if this label is not a list marker, and next is a list marker
-            is_marker = bool(re.match(r'^([a-z]\)|\d+\.|[ivx]+\))', lbl, re.IGNORECASE))
-            if not is_marker:
-                if idx + 1 < len(lblock):
-                    nxt_lbl = ' '.join(str(c).strip() for c in lblock[idx+1][0:2]).strip()
-                    if bool(re.match(r'^([a-z]\)|\d+\.|[ivx]+\))', nxt_lbl, re.IGNORECASE)):
+            
+            # Check if this is a list marker
+            is_marker = bool(re.match(r'^(\(?[a-z]\)|\d+\.|\(?[ivx]+\))', lbl, re.IGNORECASE))
+            
+            # If not a marker, check if next rows in full list have list markers or sub-items
+            if not is_marker and lbl.strip():
+                # Look ahead in the full rows list (starting from lblock_start + idx)
+                for next_idx in range(lblock_start + idx + 1, min(lblock_start + idx + 5, len(all_rows))):
+                    nxt_lbl = ' '.join(str(c).strip() for c in all_rows[next_idx][0:2]).strip()
+                    if not nxt_lbl:
+                        continue  # Skip blank rows
+                    # If we find a list marker, current row is likely a section header
+                    if bool(re.match(r'^(\(?[a-z]\)|\d+\.|\(?[ivx]+\))', nxt_lbl, re.IGNORECASE)):
                         return True
+                    # If it's another non-marker label, stop looking (not a section)
+                    is_next_marker = bool(re.match(r'^(\(?[a-z]\)|\d+\.|\(?[ivx]+\))', nxt_lbl, re.IGNORECASE))
+                    if not is_next_marker:
+                        break
             return False
 
         new_rows = []
@@ -123,7 +280,7 @@ class TableReconstructor:
 
             # Identify which labels are data-capable (not headers)
             data_capable_indices = [idx for idx in range(len(label_block)) 
-                                    if not _is_section_header(idx, label_block)]
+                                    if not _is_section_header(idx, label_block, rows, i)]
             
             n_capable = len(data_capable_indices)
             n_data = len(data_block)
@@ -159,6 +316,42 @@ class TableReconstructor:
             i = j
 
         table.rows = new_rows
+        return table
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  STEP 0: Fix garbled / character-spaced headers
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _fix_garbled_headers(table: TableData) -> TableData:
+        """
+        Fix headers where pdfplumber extracts vertical/rotated text as
+        single characters separated by spaces, e.g.:
+          'I n V s a u r r i a a n b c le e' → 'Variable Insurance'
+          'ssets H a e b l o d ...' → garbled NAV header
+        
+        Strategy: detect cells where most tokens are 1-2 chars and collapse them,
+        then try to match against known IRDAI column names.
+        """
+        # Known IRDAI sub-column names that appear in garbled form
+        _KNOWN_NAMES = {
+            'VARIABLE INSURANCE': 'Variable Insurance',
+            'VAR INS': 'Var. Ins',
+            'VARINS': 'Var. Ins',
+        }
+        
+        all_rows = table.headers + table.rows[:5]  # Check headers + first few rows
+        if not all_rows:
+            return table
+        
+        for row in all_rows:
+            for ci in range(len(row)):
+                cell = str(row[ci]).strip()
+                if not cell or len(cell) < 5:
+                    continue
+                
+                row[ci] = _degarble_cell(cell)
+        
         return table
 
     @staticmethod
@@ -282,6 +475,156 @@ class TableReconstructor:
         return table
 
     @staticmethod
+    def _redistribute_schedule_numeric_blobs(table: TableData) -> TableData:
+        """
+        Fix rows where extraction drops label+numbers or number blocks into
+        the Schedule/Ref column (or duplicates the same blob in label+schedule).
+
+        This is common in L-1 style revenue-account tables where the Schedule
+        column should contain only refs like L-4/L-5/L-6/L-7.
+        """
+        if not table.rows:
+            return table
+
+        ref_code = re.compile(r'^[A-Z]+-?\d+$')
+
+        # Only run this repair on schedule-like tables.
+        schedule_col = -1
+        for hrow in table.headers[:8]:
+            for ci, c in enumerate(hrow):
+                up = str(c).upper().strip()
+                if "SCHEDULE" in up or "REF" in up:
+                    schedule_col = ci
+                    break
+            if schedule_col >= 0:
+                break
+
+        # Ref-code driven inference: pick the column that actually carries
+        # L-4/L-5/... style references. This handles cases where header text
+        # is merged into col0 and falsely suggests schedule_col=0.
+        if table.rows:
+            max_cols = max(len(r) for r in table.rows)
+            probe_cols = min(max_cols, 5)
+            ref_hits_by_col = [0] * probe_cols
+            for r in table.rows[:120]:
+                for ci in range(probe_cols):
+                    if ci < len(r) and ref_code.match(str(r[ci]).strip()):
+                        ref_hits_by_col[ci] += 1
+
+            if ref_hits_by_col:
+                best_col = max(range(probe_cols), key=lambda c: ref_hits_by_col[c])
+                if ref_hits_by_col[best_col] >= 2:
+                    schedule_col = best_col
+
+        # Last fallback for IRDAI layouts.
+        if schedule_col < 0 and any(len(r) > 1 for r in table.rows):
+            schedule_col = 1
+
+        # Col0 is almost always label/particulars. If detection picked 0 and
+        # table has at least 2 cols, prefer col1.
+        if schedule_col == 0 and any(len(r) > 1 for r in table.rows):
+            schedule_col = 1
+
+        if schedule_col < 0:
+            return table
+        token_pattern = re.compile(
+            r'\(\s*[0-9][0-9,. ]*\s*\)'
+            r'|[0-9][0-9,.]*'
+            r'|-(?=\s|$)'
+        )
+
+        def _extract_label_and_tokens(text: str) -> tuple[str, list[str]]:
+            s = (text or "").strip()
+            if not s:
+                return "", []
+
+            all_matches = list(token_pattern.finditer(s))
+            if not all_matches:
+                return s, []
+
+            split_idx = len(s)
+            for m in all_matches:
+                start = m.start()
+                remaining = s[start:]
+                cleaned = re.sub(
+                    r'\(\s*[0-9][0-9,. ]*\s*\)|[0-9][0-9,.]*|\s+|-',
+                    '',
+                    remaining,
+                ).strip()
+                if not cleaned:
+                    split_idx = start
+                    break
+
+            label = s[:split_idx].strip()
+            num_text = s[split_idx:]
+            tokens = token_pattern.findall(num_text)
+            tokens = [t.replace(' ', '') for t in tokens]
+            tokens = _merge_split_numbers(tokens)
+            return label, tokens
+
+        def _looks_polluted(text: str) -> bool:
+            _, toks = _extract_label_and_tokens(text)
+            return len(toks) >= 3
+
+        for row in table.rows:
+            if len(row) <= schedule_col + 1:
+                continue
+
+            label = str(row[0]).strip() if row else ""
+            sched = str(row[schedule_col]).strip()
+
+            # Case 1: Label column itself is polluted with trailing numeric blob.
+            if _looks_polluted(label):
+                ltxt, ltokens = _extract_label_and_tokens(label)
+                if ltxt and ltokens:
+                    row[0] = ltxt
+                    start = schedule_col + 1
+                    for i, tok in enumerate(ltokens):
+                        ci = start + i
+                        if ci >= len(row):
+                            break
+                        cur = str(row[ci]).strip()
+                        if not cur or cur == tok:
+                            row[ci] = tok
+                    if schedule_col < len(row) and str(row[schedule_col]).strip() == label:
+                        row[schedule_col] = ""
+
+            if not sched:
+                continue
+            if ref_code.match(sched):
+                continue
+
+            stxt, stokens = _extract_label_and_tokens(sched)
+
+            # Case 2: Pure text leaked into Schedule.
+            if not stokens:
+                if stxt and (not str(row[0]).strip()):
+                    row[0] = stxt
+                    row[schedule_col] = ""
+                elif stxt and str(row[0]).strip() == stxt:
+                    row[schedule_col] = ""
+                continue
+
+            # Case 3: Schedule has label+numbers or numeric blob.
+            # Put label in col0 when col0 is empty or duplicated polluted text.
+            cur_label = str(row[0]).strip()
+            if stxt and (not cur_label or cur_label == sched or _looks_polluted(cur_label)):
+                row[0] = stxt
+
+            start = schedule_col + 1
+            for i, tok in enumerate(stokens):
+                ci = start + i
+                if ci >= len(row):
+                    break
+                cur = str(row[ci]).strip()
+                if not cur or cur == tok:
+                    row[ci] = tok
+
+            row[schedule_col] = ""
+
+        return table
+
+    @staticmethod
     def _split_numeric_data_columns(table: TableData) -> TableData:
         """
         Detects if a column is consistently space-delimited with N tokens, 
@@ -295,6 +638,13 @@ class TableReconstructor:
         col_splits = {}
         
         for ci in range(num_cols):
+            # Never split the first two structural columns (typically
+            # Particulars + Schedule/Ref). Splitting these causes
+            # column-shift regressions where LIFE/PENSION/etc. values
+            # move into newly created columns.
+            if ci < 2:
+                continue
+
             tokens_count = {}
             data_cells_count = 0
             for row in all_rows:
@@ -503,6 +853,17 @@ class TableReconstructor:
                     #    "3 02" -> "302" but only if strictly 2-3 digits follow
                     fixed = re.sub(r'(^|\s|\()(\d{1,2})\s+(\d{2,3})(?=\s|$|\))', r'\1\2\3', fixed)
                     
+                    # 4b. Fix single-digit space splits: "6 5" -> "65", "7 9" -> "79"
+                    #     Only when the entire content is just "d d" (standalone small numbers)
+                    if re.match(r'^\d\s+\d$', fixed.strip()):
+                        fixed = fixed.replace(' ', '')
+                    
+                    # 5. Fix space before decimal point: "1 .88" -> "1.88"
+                    fixed = re.sub(r'(\d)\s+(\.\d)', r'\1\2', fixed)
+                    
+                    # 6. Fix space inside decimal number: "8 1.39" -> "81.39"
+                    fixed = re.sub(r'(^|\s|\()(\d{1,2})\s+(\d{1,2}\.\d+)', r'\1\2\3', fixed)
+                    
                     fixed_lines.append(fixed)
                 
                 row[ci] = '\n'.join(fixed_lines)
@@ -561,8 +922,7 @@ class TableReconstructor:
         RULES:
         1. 2+ multi-line columns → expand (each sub-line = new row)
         2. Single multiline column → expand if it looks like a numeric/serial data list
-        3. Only 1–2 non-empty cells (merged title) → collapse UNLESS it looks like a data list (e.g. serials)
-        4. C0 Label List Capping: if C0 has >>more lines than data columns, cap expansion
+        3. Only 1–2 non-empty cells (merged title) → collapse
         """
         all_rows = table.headers + table.rows
         if not all_rows:
@@ -574,139 +934,108 @@ class TableReconstructor:
             cell_texts = []
             for cell in row:
                 text = cell if cell and cell != "None" else ""
-                # Do NOT strip() the entire text, because that removes leading \n 
-                # which are critically needed to align data with the correct label row.
                 cell_texts.append(text)
 
             non_empty = [c for c in cell_texts if c]
             multiline_indices = [i for i, c in enumerate(cell_texts) if "\n" in c]
-            
-            # Identify if ANY cell in this row looks like a vertical data list (serials or financial values)
-            is_data_list = any(TableReconstructor._looks_like_data_list(cell_texts[i]) for i in multiline_indices)
-            
-            should_expand = False
-            if len(multiline_indices) >= 2:
-                should_expand = True
-            elif len(multiline_indices) == 1 and is_data_list:
-                should_expand = True
-            elif is_data_list:
-                should_expand = True
-                
-            # If a single cell has a massive amount of lines, we need to know if it's a lumped data 
-            # column (which needs expansion) or just a giant top-level header title block (which shouldn't be expanded).
+
+            if not multiline_indices:
+                # No multiline cells — keep as-is
+                expanded.append([c.replace("\n", " ").strip() for c in cell_texts])
+                continue
+
+            # Check if any cell looks like a data list
+            is_data_list = any(
+                TableReconstructor._looks_like_data_list(cell_texts[i])
+                for i in multiline_indices
+            )
+
             has_massive_cell = any(c.count('\n') >= 3 for c in cell_texts)
-            is_header_title_block = len(non_empty) == 1 and non_empty[0].count('\n') >= 4 and len(expanded) < 3
+            is_header_title_block = (
+                len(non_empty) == 1
+                and non_empty[0].count('\n') >= 4
+                and len(expanded) < 3
+            )
 
-            if len(non_empty) <= 2 and not is_data_list and (not has_massive_cell or is_header_title_block):
-                # True title/merged row (not a data list), or a giant header block — collapse
+            should_expand = (
+                len(multiline_indices) >= 2
+                or is_data_list
+                or (has_massive_cell and not is_header_title_block)
+            )
+
+            if not should_expand:
                 collapsed = [c.replace("\n", " ").strip() for c in cell_texts]
                 expanded.append(collapsed)
-            elif should_expand or (has_massive_cell and not is_header_title_block):
-                # Expand sub-rows
-                split_cells = []
-                max_lines = 1
-                max_data_lines = 1  # Max lines in columns OTHER than C0
-                for ci, text in enumerate(cell_texts):
-                    lines = [l.strip() for l in text.split("\n")] if text and "\n" in text else [text]
-                    split_cells.append(lines)
-                    max_lines = max(max_lines, len(lines))
-                    if ci > 0:
-                        max_data_lines = max(max_data_lines, len(lines))
+                continue
 
-                # Smart cap for C0 Label Lists (e.g. adityabirla case)
-                # Only cap if there is actually data in other columns to align with
-                c0_lines = len(split_cells[0]) if split_cells else 1
-                if c0_lines > max_data_lines * 3 and max_data_lines > 1:
-                    expand_count = max_data_lines
-                    # Join remaining C0 labels into last expanded row
-                    for li in range(expand_count):
-                        new_row = []
-                        for ci, cl in enumerate(split_cells):
-                            if ci == 0 and li == expand_count - 1:
-                                # Last row: join remaining C0 lines
-                                remaining = [l for l in cl[li:] if l.strip()]
-                                new_row.append("\n".join(remaining))
-                            elif li < len(cl):
-                                new_row.append(cl[li])
-                            else:
-                                new_row.append("")
-                        expanded.append(new_row)
-                else:
-                    for li in range(max_lines):
-                        new_row = []
-                        for cl in split_cells:
-                            if li < len(cl):
-                                new_row.append(cl[li])
-                            elif len(cl) == 1 and li > 0:
-                                # Do NOT duplicate a single-line label across all expanded rows
-                                new_row.append("")
-                            else:
-                                new_row.append("")
-                        expanded.append(new_row)
-            else:
-                # No expansion needed — collapse newlines to avoid row height issues
-                collapsed = [c.replace("\n", " ").strip() for c in cell_texts]
-                expanded.append(collapsed)
+            # Expand: split each cell by \n, create one row per line
+            split_cells = []
+            max_lines = 1
+            for ci, text in enumerate(cell_texts):
+                lines = [l.strip() for l in text.split("\n")] if text and "\n" in text else [text]
+                split_cells.append(lines)
+                max_lines = max(max_lines, len(lines))
 
-        expanded = [r for r in expanded if any(c.strip() for c in r)]
+            # Smart alignment: when col 0 contains section headers mixed with
+            # sub-items (e.g. "Premiums earned - net\n(a) Premium\n(b)...")
+            # but data columns only have values for the sub-items, insert
+            # blank data lines at section-header positions so sub-item
+            # labels line up with their data.
+            label_lines_list = split_cells[0] if split_cells else []
+            n_labels = len(label_lines_list)
+            data_max = max((len(cl) for ci, cl in enumerate(split_cells) if ci >= 1 and len(cl) > 1), default=n_labels)
 
-        # Merge continuation lines: If a row is label-only and the label
-        # starts with a lowercase letter or is a single short word (like "Funds"),
-        # it's likely a text-wrap continuation of the previous row's label.
-        if len(expanded) > 1:
-            merged = [expanded[0]]
-            for row in expanded[1:]:
-                # Find the main label column (first non-empty text column)
-                label_col = -1
-                label_text = ""
-                for ci, c in enumerate(row):
-                    if c.strip() and not TableReconstructor._is_numeric(c.strip()):
-                        label_col = ci
-                        label_text = c.strip()
-                        break
-                
-                # Check if this row has data in columns beyond the label columns
-                has_data = False
-                if label_col >= 0:
-                    for ci in range(max(label_col + 1, 2), len(row)):
-                        if ci < len(row) and row[ci].strip():
-                            has_data = True
-                            break
-                
-                if (not has_data and label_text and label_col >= 0 and merged
-                    and not TableReconstructor._is_numeric(label_text)):
-                    # Check if it looks like a continuation:
-                    # - Starts with lowercase letter
-                    # - Is a single short word (< 20 chars) without a prefix like (a), 1., etc.
-                    # - Doesn't start with a standard item prefix
-                    is_item_prefix = bool(re.match(
-                        r'^(\d+[\.\)\s]|[a-z]\)|[a-z]{1,2}\)|'
-                        r'\([a-z]\)|\([a-z]{2}\)|'
-                        r'SUB|TOTAL|SURPLUS|DEFICIT|AMOUNT|BENEFIT|'
-                        r'Commission|Operating|Provision|Bad|Goods|'
-                        r'Investments? |Other |Transfer|Balance|APPROPRIATION)',
-                        label_text, re.IGNORECASE
-                    ))
-                    
-                    if is_item_prefix:
-                        is_continuation = False
-                    else:
-                        is_continuation = (
-                            (label_text[0].islower() and len(label_text) < 100)
-                            or label_text.startswith('(')
-                            or (len(label_text.split()) <= 4 and len(label_text) < 40)
-                        )
-                    
-                    if is_continuation:
-                        # Merge into previous row's label
-                        prev = merged[-1]
-                        if label_col < len(prev):
-                            prev_text = prev[label_col].strip()
-                            prev[label_col] = prev_text + " " + label_text if prev_text else label_text
+            if n_labels > data_max and data_max > 1:
+                _subitem_re = re.compile(r'^\(?[a-z]\)|\d+\.|\(?[ivx]+\)', re.IGNORECASE)
+                section_hdr_indices = set()
+                for li, line in enumerate(label_lines_list):
+                    ls = line.strip()
+                    if not ls:
                         continue
-                
-                merged.append(row)
-            expanded = merged
+                    if not _subitem_re.match(ls):
+                        has_subitems = any(
+                            _subitem_re.match(label_lines_list[j].strip())
+                            for j in range(li + 1, min(li + 4, n_labels))
+                            if label_lines_list[j].strip()
+                        )
+                        if has_subitems:
+                            section_hdr_indices.add(li)
+
+                if section_hdr_indices:
+                    for ci in range(1, len(split_cells)):
+                        orig = split_cells[ci]
+                        if len(orig) <= 1 and not (orig and orig[0].strip()):
+                            continue
+                        new_lines = []
+                        di = 0
+                        for li in range(n_labels):
+                            if li in section_hdr_indices:
+                                new_lines.append("")
+                            elif di < len(orig):
+                                new_lines.append(orig[di])
+                                di += 1
+                            else:
+                                new_lines.append("")
+                        split_cells[ci] = new_lines
+                    max_lines = max(len(cl) for cl in split_cells)
+
+            for li in range(max_lines):
+                new_row = []
+                for cl in split_cells:
+                    if li < len(cl):
+                        new_row.append(cl[li])
+                    elif len(cl) == 1 and li > 0:
+                        new_row.append("")
+                    else:
+                        new_row.append("")
+                expanded.append(new_row)
+
+        # Preserve intentional internal blank rows (visual spacing in source tables)
+        # and only trim leading/trailing blank padding rows.
+        while expanded and not any(c.strip() for c in expanded[0]):
+            expanded.pop(0)
+        while expanded and not any(c.strip() for c in expanded[-1]):
+            expanded.pop()
 
         if not expanded:
             table.headers = []
@@ -715,6 +1044,53 @@ class TableReconstructor:
 
         table.headers = [expanded[0]]
         table.rows = expanded[1:]
+        return table
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  STEP 2b: Merge continuation rows (label fragments from line wrapping)
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _merge_continuation_rows(table: TableData) -> TableData:
+        """Merge rows where pdfplumber wrapped a long sub-item label across two rows.
+
+        A continuation row is detected when:
+        - All data columns (index 1+) are empty.
+        - The previous row starts with a sub-item marker like (a), (b), i), 1.
+          and has at least one non-empty data column.
+        - The current row's label does NOT start with a sub-item marker or
+          section keyword (Sub, TOTAL, Total).
+        """
+        all_rows = table.headers + table.rows
+        if len(all_rows) < 2:
+            return table
+
+        subitem_re = re.compile(r'^\(?[a-z]\)|\d+\.|\(?[ivx]+\)', re.IGNORECASE)
+        section_re = re.compile(r'^(Sub\s|TOTAL|Total)', re.IGNORECASE)
+
+        merged: list[list[str]] = [list(all_rows[0])]
+        for i in range(1, len(all_rows)):
+            row = all_rows[i]
+            c0 = (row[0] or '').strip()
+            data_empty = all(not (c or '').strip() for c in row[1:])
+
+            prev = merged[-1]
+            prev_c0 = (prev[0] or '').strip()
+            prev_has_data = any((c or '').strip() for c in prev[1:])
+
+            if (c0
+                    and data_empty
+                    and prev_has_data
+                    and subitem_re.match(prev_c0)
+                    and not subitem_re.match(c0)
+                    and not section_re.match(c0)):
+                # Append fragment to previous row's label
+                prev[0] = prev_c0 + ' ' + c0
+            else:
+                merged.append(list(row))
+
+        table.headers = [merged[0]]
+        table.rows = merged[1:]
         return table
 
     # ══════════════════════════════════════════════════════════════════════
@@ -731,7 +1107,12 @@ class TableReconstructor:
         found_data = False
 
         for ri, row in enumerate(all_rows):
-            if not found_data and self._is_header_row(row, ri):
+            # Strong data boundary: once a row clearly looks like data
+            # (schedule ref and/or multiple numeric cells), stop header scan.
+            if not found_data and self._is_strong_data_row(row):
+                found_data = True
+                data_rows.append(row)
+            elif not found_data and self._is_header_row(row, ri, all_rows):
                 header_rows.append(row)
             else:
                 found_data = True
@@ -739,26 +1120,90 @@ class TableReconstructor:
 
         if not header_rows and data_rows:
             header_rows = [data_rows.pop(0)]
-        # Allow up to 8 header rows for complex multi-level financial tables
-        if len(header_rows) > 8:
-            data_rows = header_rows[8:] + data_rows
-            header_rows = header_rows[:8]
+
+        # If everything is classified as header, preserve only a shallow header band
+        # and move the rest to data to avoid overlapping-header artifacts.
+        if header_rows and not data_rows:
+            keep = min(4, len(header_rows))
+            data_rows = header_rows[keep:]
+            header_rows = header_rows[:keep]
+
+        # Allow deeper header bands for complex insurer schedules.
+        max_header_rows = 12
+        if len(header_rows) > max_header_rows:
+            data_rows = header_rows[max_header_rows:] + data_rows
+            header_rows = header_rows[:max_header_rows]
 
         table.headers = header_rows
         table.rows = data_rows
         return table
 
-    def _is_header_row(self, row: list[str], row_idx: int) -> bool:
+    def _is_strong_data_row(self, row: list[str]) -> bool:
+        """
+        Detect rows that are unmistakably data rows.
+        Used to prevent header detection from swallowing first data rows.
+        """
+        if not row:
+            return False
+
+        # Common schedule refs: L-4, L-5, etc.
+        if len(row) > 1 and re.match(r'^[A-Z]+-?\d+$', str(row[1]).strip()):
+            return True
+
+        non_empty = [str(c).strip() for c in row if str(c).strip()]
+        if not non_empty:
+            return False
+
+        # If a row has several numeric cells, it's data, not header.
+        numeric_count = sum(1 for c in non_empty if self._is_numeric(c))
+        if numeric_count >= 3:
+            return True
+
+        # A labeled row plus at least two numeric values is data.
+        first = str(row[0]).strip() if row else ""
+        if first and not self._is_numeric(first) and numeric_count >= 2:
+            return True
+
+        return False
+
+    def _is_header_row(self, row: list[str], row_idx: int, all_rows: list[list[str]] = None) -> bool:
         non_empty = [c for c in row if c.strip()]
         if not non_empty:
             return True  # Empty rows in header section are kept
         numeric = sum(1 for c in non_empty if self._is_numeric(c))
         text = len(non_empty) - numeric
+
+        # Metadata header lines often contain one textual phrase plus a year/date.
+        # Keep these in header for the initial section.
+        first_cell = row[0].strip().upper() if row else ""
+        meta_keywords = (
+            "REVENUE ACCOUNT",
+            "POLICYHOLDERS' ACCOUNT",
+            "POLICYHOLDERS ACCOUNT",
+            "AMOUNTS",
+            "LINKED BUSINESS",
+            "NON LINKED",
+            "NON-LINKED",
+            "PARTICULARS",
+            "SCHEDULE",
+            "REF. FORM",
+            "REGISTRATION NUMBER",
+        )
+        if row_idx <= 15 and any(k in first_cell for k in meta_keywords) and text >= 1:
+            return True
+
+        # Multi-column header band rows (Individual/Group/Pension/etc.)
+        # can appear with empty first cell and should remain in headers.
+        row_upper = ' '.join(c.strip().upper() for c in row if c.strip())
+        band_keywords = ("INDIVIDUAL", "GROUP", "PENSION", "ANNUITY", "VARIABLE", "HEALTH")
+        if row_idx <= 20 and numeric == 0 and any(k in row_upper for k in band_keywords):
+            return True
+
         # Single cell: header if it's text (not a numbered item like "1 Available...")
         if len(non_empty) == 1:
             val = non_empty[0].strip()
             # Item numbers followed by text are data, not headers
-            if re.match(r'^\d+[\s\.\)]', val) or re.match(r'^[a-z]\)', val.lower()):
+            if re.match(r'^\d+[\s\.\)]', val) or re.match(r'^\(?[a-z]\)', val.lower()):
                 return False
             
             # Very first row is almost always a header title
@@ -766,7 +1211,12 @@ class TableReconstructor:
                 return True
                 
             # Standard structural header keywords
-            keywords = ["PARTICULARS", "SCHEDULE", "AS AT", "TOTAL", "QUARTER", "YEAR"]
+            keywords = [
+                "PARTICULARS", "SCHEDULE", "AS AT", "TOTAL", "QUARTER", "YEAR",
+                "REVENUE ACCOUNT", "POLICYHOLDERS' ACCOUNT", "POLICYHOLDERS ACCOUNT",
+                "AMOUNTS", "LINKED BUSINESS", "NON LINKED", "NON-LINKED",
+                "FORM L-", "REGISTRATION NUMBER", "REF. FORM", "REF FORM", "NO.",
+            ]
             if any(kw in val.upper() for kw in keywords):
                 return True
                 
@@ -775,9 +1225,21 @@ class TableReconstructor:
             # However, if it's very early in the table (row 1 or 2), it might be 
             # a subtitle like "Name of the Insurer: ...", which IS a header.
             if row[0].strip() == val and not val.isupper() and row_idx >= 3:
-                return False
+                # Short plain labels are usually data, but long descriptor lines
+                # in financial statements are often header/sub-header text.
+                if len(val.split()) <= 3:
+                    return False
                 
-            return text == 1
+                # Check if next rows have sub-item markers (a), (b), (i), (ii)
+                # If they do, this is a section label in data, not a header
+                if all_rows and row_idx + 1 < len(all_rows):
+                    for next_idx in range(row_idx + 1, min(row_idx + 4, len(all_rows))):
+                        nxt_lbl = ' '.join(str(c).strip() for c in all_rows[next_idx][0:2]).strip()
+                        if nxt_lbl and re.match(r'^(\(?[a-z]\)|\d+\.|\(?[ivx]+\))', nxt_lbl, re.IGNORECASE):
+                            # Found a sub-item marker, so current row is a section label (data), not header
+                            return False
+                
+                return text == 1
         return text > numeric
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1004,6 +1466,143 @@ class TableReconstructor:
 # ══════════════════════════════════════════════════════════════════════
 #  Module-level helper functions for column splitting
 # ══════════════════════════════════════════════════════════════════════
+
+
+def _degarble_cell(text: str) -> str:
+    """
+    Fix garbled text where pdfplumber extracts vertical/rotated text as
+    single characters separated by spaces (from vertical/rotated columns).
+    
+    The characters from multiple vertical words are interleaved, so we use
+    character-frequency (anagram) matching against known IRDAI terms.
+    
+    Example:
+      'Life Pension Health I n V s a u r r i a a n b c le e'
+      → 'Life Pension Health Variable Insurance'
+    """
+    if not text or len(text) < 5:
+        return text
+    
+    if '\n' in text:
+        lines = text.split('\n')
+        return '\n'.join(_degarble_cell(line) for line in lines)
+    
+    tokens = text.split()
+    if len(tokens) < 4:
+        return text
+    
+    # Find runs of short tokens (1-2 chars) — these are garbled segments
+    # Rebuild text by replacing garbled runs with matched known words
+    result_parts = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if len(t) <= 2 and not t.isdigit():
+            # Collect consecutive short tokens
+            chars = [t]
+            j = i + 1
+            while j < len(tokens) and len(tokens[j]) <= 2 and not tokens[j].isdigit():
+                chars.append(tokens[j])
+                j += 1
+            
+            if len(chars) >= 4:
+                collapsed = ''.join(chars)
+                matched = _match_known_words(collapsed)
+                result_parts.append(matched)
+            else:
+                result_parts.extend(chars)
+            i = j
+        else:
+            result_parts.append(t)
+            i += 1
+    
+    return ' '.join(result_parts)
+
+
+def _match_known_words(collapsed: str) -> str:
+    """
+    Match collapsed garbled characters against known IRDAI column terms
+    using character-frequency (anagram) matching.
+    
+    The interleaved chars of 'Variable' + 'Insurance' produce a string whose
+    character set equals the union of both words — so anagram matching works.
+    """
+    from collections import Counter
+    
+    def _char_freq(s: str) -> Counter:
+        return Counter(s.lower().replace(' ', ''))
+    
+    target = _char_freq(collapsed)
+    
+    # Canonical IRDAI column order (for correct output ordering)
+    _IRDAI_ORDER = ['Life', 'Pension', 'Health', 'Variable Insurance',
+                     'Insurance', 'Variable', 'Annuity', 'Total']
+    
+    # Known terms for matching
+    _KNOWN_TERMS = [
+        'Variable Insurance', 'Insurance', 'Variable',
+        'Annuity', 'Pension', 'Health', 'Total', 'Life',
+    ]
+    
+    # 1) Try splitting at uppercase boundaries first (handles sequential case
+    #    like "LifePension" where chars aren't interleaved)
+    parts = re.split(r'(?=[A-Z])', collapsed)
+    parts = [p for p in parts if p]
+    if len(parts) >= 2:
+        matched_parts = []
+        for p in parts:
+            for term in _KNOWN_TERMS:
+                if p.lower() == term.lower().replace(' ', ''):
+                    matched_parts.append(term)
+                    break
+        if len(matched_parts) == len(parts):
+            # Sort by canonical IRDAI order
+            order_map = {t.lower(): i for i, t in enumerate(_IRDAI_ORDER)}
+            matched_parts.sort(key=lambda t: order_map.get(t.lower(), 99))
+            return ' '.join(matched_parts)
+    
+    # 2) Exact anagram match for single term
+    for term in _KNOWN_TERMS:
+        if _char_freq(term) == target:
+            return term
+    
+    # 3) Pair combinations (covers interleaved two-word headers)
+    for i, t1 in enumerate(_KNOWN_TERMS):
+        for j, t2 in enumerate(_KNOWN_TERMS):
+            if j <= i:
+                continue
+            if _char_freq(t1 + t2) == target:
+                # Sort by canonical IRDAI column order
+                pair = sorted([t1, t2],
+                              key=lambda t: next(
+                                  (k for k, v in enumerate(_IRDAI_ORDER)
+                                   if v.lower() == t.lower()), 99))
+                return ' '.join(pair)
+    
+    # 4) Greedy prefix match as last resort
+    upper = collapsed.upper()
+    _PREFIXES = [
+        ('VARIABLEINSURANCE', 'Variable Insurance'),
+        ('VARIABLE', 'Variable'), ('INSURANCE', 'Insurance'),
+        ('ANNUITY', 'Annuity'), ('PENSION', 'Pension'),
+        ('HEALTH', 'Health'), ('TOTAL', 'Total'), ('LIFE', 'Life'),
+    ]
+    remaining = upper
+    found: list[str] = []
+    while remaining:
+        matched = False
+        for pat, repl in _PREFIXES:
+            if remaining.startswith(pat):
+                found.append(repl)
+                remaining = remaining[len(pat):]
+                matched = True
+                break
+        if not matched:
+            remaining = remaining[1:]
+    if found:
+        return ' '.join(found)
+    
+    return collapsed
 
 def _parse_sub_header(cell_text: str) -> list[str]:
     """Parse sub-header names from a merged header cell."""
