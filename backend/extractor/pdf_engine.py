@@ -108,7 +108,8 @@ class PDFExtractor:
     def _extract_page_parallel(self, page: Any, page_number: int) -> list[TableData]:
         """
         Extract page using ALL 3 methods in parallel threads.
-        Combines results from all methods using intelligent merging.
+        Picks the BEST-scoring method's tables, then uses others only to
+        fill empty cells — guaranteeing one set of tables per page (no duplicates).
         """
         results = {}
         
@@ -136,27 +137,33 @@ class PDFExtractor:
                 except Exception as e:
                     logger.debug("P%d %s extraction failed: %s", page_number, method, e)
         
-        # Merge all extracted results intelligently
         if not results:
             return []
         
-        # Collect all tables from all methods with their metadata
-        all_tables_with_source = []
+        # Pick the single best-scoring method
+        best_method = max(results, key=lambda m: results[m][0].score)
+        best_score, best_tables = results[best_method]
+        
+        # Collect tables from other methods for gap-filling
+        other_tables = []
         for method, (score, tables) in results.items():
-            for table in tables:
-                all_tables_with_source.append({
-                    'table': table,
-                    'method': method,
-                    'score': score.score
-                })
+            if method != best_method:
+                other_tables.extend(tables)
         
-        # Merge tables from different methods
-        merged_tables = self._merge_tables_from_methods(all_tables_with_source, page_number)
+        # Fill empty cells in best tables using data from other methods
+        for table in best_tables:
+            all_rows = (table.headers or []) + (table.rows or [])
+            filled = self._fill_cell_gaps(all_rows, other_tables, table)
+            if table.headers:
+                table.headers = filled[:len(table.headers)]
+                table.rows = filled[len(table.headers):]
+            else:
+                table.rows = filled
         
-        logger.info("P%d: Merged %d results from %d methods → %d output tables", 
-                   page_number, len(all_tables_with_source), len(results), len(merged_tables))
+        logger.info("P%d: Best=%s (score=%.2f), %d tables, gap-filled from %d other methods",
+                   page_number, best_method, best_score.score, len(best_tables), len(results) - 1)
         
-        return merged_tables
+        return best_tables
     
     def _merge_tables_from_methods(self, tables_with_source: list[dict], page_number: int) -> list[TableData]:
         """
@@ -573,9 +580,10 @@ class PDFExtractor:
 
         Steps:
           1. Extract all words with bounding boxes
-          2. Determine column boundaries from vertical edges (+ text margins)
-          3. Cluster words into rows by y-position
-          4. Place each word into the correct (row, col) cell
+          2. Cluster words into rows by y-position
+          3. Within each row, group nearby words into phrases (keeps sentences together)
+          4. Determine column boundaries from consistent inter-phrase gaps
+          5. Place each phrase into the correct (row, col) cell
         """
         from collections import defaultdict
 
@@ -583,13 +591,6 @@ class PDFExtractor:
             words = page.extract_words(x_tolerance=3, y_tolerance=3)
             if not words or len(words) < 5:
                 return None
-
-            # --- Column boundaries ---
-            col_bounds = self._detect_column_boundaries(page, words)
-            if not col_bounds or len(col_bounds) < 3:
-                return None  # Need at least 2 columns
-
-            ncols = len(col_bounds) - 1
 
             # --- Row clustering (group words within 5px vertically) ---
             words_sorted = sorted(words, key=lambda w: w['top'])
@@ -606,7 +607,71 @@ class PDFExtractor:
             if len(row_groups) < 2:
                 return None
 
-            # --- Build grid ---
+            # --- Build phrases: merge words that are close together ---
+            # First, compute the typical small gap (within-phrase) vs large gap
+            # (between-column) across all rows to find an adaptive threshold.
+            all_gaps = []
+            for rg in row_groups:
+                for i in range(1, len(rg)):
+                    gap = rg[i]['x0'] - rg[i - 1]['x1']
+                    if gap > 0:
+                        all_gaps.append(gap)
+            
+            # Use the gap distribution to find the split point.
+            # Small gaps (< 30px) are within-phrase, large gaps are between columns.
+            if all_gaps:
+                all_gaps.sort()
+                # Find the biggest jump in sorted gaps — that's the phrase/column boundary
+                max_jump = 0
+                phrase_gap_threshold = 15  # default
+                for i in range(1, len(all_gaps)):
+                    jump = all_gaps[i] - all_gaps[i - 1]
+                    if jump > max_jump and all_gaps[i - 1] < 80:
+                        max_jump = jump
+                        # Threshold is midpoint of the jump
+                        phrase_gap_threshold = (all_gaps[i - 1] + all_gaps[i]) / 2
+                phrase_gap_threshold = max(10, min(60, phrase_gap_threshold))
+            else:
+                phrase_gap_threshold = 15
+
+            phrase_rows: list[list[dict]] = []  # each phrase: {x0, x1, text}
+            for rg in row_groups:
+                phrases = []
+                if not rg:
+                    continue
+                cur_phrase = {'x0': rg[0]['x0'], 'x1': rg[0]['x1'], 'text': rg[0]['text']}
+                for w in rg[1:]:
+                    gap = w['x0'] - cur_phrase['x1']
+                    if gap < phrase_gap_threshold:  # same phrase — keep words together
+                        cur_phrase['text'] += ' ' + w['text']
+                        cur_phrase['x1'] = w['x1']
+                    else:
+                        phrases.append(cur_phrase)
+                        cur_phrase = {'x0': w['x0'], 'x1': w['x1'], 'text': w['text']}
+                phrases.append(cur_phrase)
+                phrase_rows.append(phrases)
+
+            # --- Column boundaries: prefer phrase-gap analysis (more accurate),
+            # fall back to PDF edges, then to text-gap analysis ---
+            col_bounds_phrases = _detect_cols_from_phrase_gaps(phrase_rows, words)
+            col_bounds_edges = self._detect_column_boundaries(page, words)
+
+            # Use whichever gives more columns (more granular = better separation)
+            if col_bounds_phrases and col_bounds_edges:
+                col_bounds = col_bounds_phrases if len(col_bounds_phrases) >= len(col_bounds_edges) else col_bounds_edges
+            elif col_bounds_phrases:
+                col_bounds = col_bounds_phrases
+            elif col_bounds_edges:
+                col_bounds = col_bounds_edges
+            else:
+                col_bounds = None
+
+            if not col_bounds or len(col_bounds) < 3:
+                return None
+
+            ncols = len(col_bounds) - 1
+
+            # --- Build grid from phrases ---
             def _get_col(x0: float) -> int:
                 for ci in range(ncols):
                     if x0 < col_bounds[ci + 1]:
@@ -614,11 +679,11 @@ class PDFExtractor:
                 return ncols - 1
 
             grid: list[list[str]] = []
-            for row_words in row_groups:
+            for phrases in phrase_rows:
                 cells: dict[int, list[str]] = defaultdict(list)
-                for w in row_words:
-                    ci = _get_col(w['x0'])
-                    cells[ci].append(w['text'])
+                for p in phrases:
+                    ci = _get_col(p['x0'])
+                    cells[ci].append(p['text'])
                 row = [' '.join(cells.get(ci, [])) for ci in range(ncols)]
                 if any(c.strip() for c in row):
                     grid.append(row)
@@ -641,7 +706,7 @@ class PDFExtractor:
                 confidence=0.80,
             )
 
-            logger.info("Word-grid P%d: %d rows × %d cols", page_number,
+            logger.info("Word-grid P%d: %d rows x %d cols", page_number,
                          len(grid), ncols)
             return [table]
 
@@ -674,6 +739,12 @@ class PDFExtractor:
         else:
             merged = []
 
+        # Validate: if the first edge is far from text left margin,
+        # the edges don't represent the actual table columns — discard them.
+        # This fixes pages where PDF edges are decorative borders, not column lines.
+        if merged and (merged[0] - min_x) > 150:
+            merged = []
+
         # Build boundaries: left margin + edges + right margin
         bounds = [min_x] + merged + [max_x]
 
@@ -685,7 +756,7 @@ class PDFExtractor:
             else:
                 clean[-1] = max(clean[-1], b)
 
-        # If no edges found, try to detect columns from text gaps
+        # If no usable edges, return empty so caller can fall back to phrase-gap analysis
         if not merged:
             clean = _detect_cols_from_text_gaps(words, min_x, max_x)
 
@@ -887,45 +958,57 @@ def _confidence(table: list[list[str]]) -> float:
 
 def _has_mega_cells(tables: list[TableData]) -> bool:
     """
-    Detect if pdfplumber produced a 'mega-cell' — a single cell containing
-    far more newlines than the table has rows, meaning the extraction crammed
-    an entire column into one cell. This is a sign that the table boundaries
-    were wrong and word-grid extraction will produce better results.
+    Detect if pdfplumber produced a TRUE extraction failure where content
+    was crammed into a single cell while other columns are empty.
+
+    Returns False (= keep pdfplumber result) when:
+      - Multiple columns in the same row have multiline content.
+        This is a legitimate multi-row cell structure (common in financial
+        tables) that the reconstructor's _expand_multiline_cells can handle.
+
+    Returns True (= fall back to word-grid) only when:
+      - A cell has many newlines AND other columns in that row are mostly empty.
+        This means the table boundary detection failed and all page content
+        was dumped into one cell.
     """
     for t in tables:
         all_rows = t.headers + t.rows
         nrows = len(all_rows)
         if nrows < 3:
             continue
+
         for row in all_rows:
+            # Count how many columns have multiline content in this row
+            multiline_cols = 0
+            max_lines = 0
+            max_cell_text_len = 0
+            non_empty_cols = 0
             for cell in row:
                 if not cell:
                     continue
+                non_empty_cols += 1
+                lc = cell.count('\n') + 1
+                if lc >= 3:
+                    multiline_cols += 1
+                if lc > max_lines:
+                    max_lines = lc
+                    max_cell_text_len = len(cell)
 
-                line_count = cell.count('\n') + 1
-                text_len = len(cell)
+            # If 2+ columns have multiline data, it's legitimate multi-row cells
+            # that the reconstructor can expand. NOT a broken extraction.
+            if multiline_cols >= 2:
+                continue
 
-                # Primary trigger: one cell contains roughly most of the table's rows.
-                strong_threshold = max(15, int(nrows * 0.70))
-                if line_count >= strong_threshold:
-                    logger.info(
-                        "Mega-cell detected on P%d (%d lines in cell vs %d rows) — falling back to word-grid",
-                        t.page_number,
-                        line_count,
-                        nrows,
-                    )
-                    return True
+            # If only 1 column has a mega-cell and others are empty,
+            # the extraction likely crammed everything into one cell.
+            if max_lines >= 15 and non_empty_cols <= 2:
+                logger.info(
+                    "Mega-cell detected on P%d (%d lines in 1 cell, only %d non-empty cols) "
+                    "— falling back to word-grid",
+                    t.page_number, max_lines, non_empty_cols,
+                )
+                return True
 
-                # Secondary trigger: very long multiline blobs are almost always
-                # extraction failures even if line_count is just below row count.
-                if line_count >= 18 and text_len >= 450:
-                    logger.info(
-                        "Mega-cell detected on P%d (long multiline blob: %d lines, %d chars) — falling back to word-grid",
-                        t.page_number,
-                        line_count,
-                        text_len,
-                    )
-                    return True
     return False
 
 
@@ -1088,5 +1171,55 @@ def _detect_cols_from_text_gaps(words: list[dict], min_x: float, max_x: float) -
     gaps.sort(key=lambda g: g[1], reverse=True)
     # Take up to 10 column boundaries
     boundaries = sorted(g[0] for g in gaps[:10])
+
+    return [min_x] + boundaries + [max_x]
+
+
+def _detect_cols_from_phrase_gaps(phrase_rows: list[list[dict]], words: list[dict]) -> list[float]:
+    """
+    Detect column boundaries by finding consistent large gaps between phrases
+    across multiple rows. A gap that appears at roughly the same x-position
+    in many rows is a column boundary.
+    """
+    from collections import Counter
+    if not phrase_rows or not words:
+        return []
+
+    min_x = min(w['x0'] for w in words) - 1
+    max_x = max(w['x1'] for w in words) + 1
+
+    # Collect inter-phrase gaps from all rows, bucketed to 10px bins
+    gap_bins: Counter = Counter()
+    for phrases in phrase_rows:
+        if len(phrases) < 2:
+            continue
+        for i in range(1, len(phrases)):
+            gap = phrases[i]['x0'] - phrases[i - 1]['x1']
+            if gap >= 15:  # significant gap
+                midpoint = (phrases[i - 1]['x1'] + phrases[i]['x0']) / 2
+                bucket = round(midpoint / 10) * 10  # 10px bucket
+                gap_bins[bucket] += 1
+
+    if not gap_bins:
+        return _detect_cols_from_text_gaps(words, min_x, max_x)
+
+    # Keep gap positions that appear in at least 15% of data rows
+    data_row_count = sum(1 for pr in phrase_rows if len(pr) >= 2)
+    min_freq = max(2, int(data_row_count * 0.15))
+    
+    boundaries = sorted(pos for pos, cnt in gap_bins.items() if cnt >= min_freq)
+    
+    # Merge boundaries that are too close (< 25px)
+    if boundaries:
+        merged = [boundaries[0]]
+        for b in boundaries[1:]:
+            if b - merged[-1] >= 25:
+                merged.append(b)
+            else:
+                merged[-1] = (merged[-1] + b) / 2  # average
+        boundaries = merged
+
+    if not boundaries:
+        return _detect_cols_from_text_gaps(words, min_x, max_x)
 
     return [min_x] + boundaries + [max_x]
