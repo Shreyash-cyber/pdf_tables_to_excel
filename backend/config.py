@@ -127,3 +127,31 @@ EMPTY_CELL_THRESHOLD = 0.40
 
 # ── Logging ───────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ── Extraction modes ──────────────────────────────────────────────────────
+# FAST: pdfplumber only (default, best for typical PDFs)
+# ACCURATE: pdfplumber + tabula (good for complex layouts)
+# THOROUGH: pdfplumber + tabula + camelot (most comprehensive, slower)
+EXTRACTION_MODE = os.getenv("EXTRACTION_MODE", "ACCURATE")
+
+# Enable hybrid extraction for PDFs detected as complex
+USE_HYBRID_EXTRACTION = os.getenv("USE_HYBRID_EXTRACTION", "true").lower() in ("true", "1", "yes")
+
+# ── Output format ─────────────────────────────────────────────────────────
+# Can be: excel, csv, json, markdown
+# Recommended for complex PDFs: json (preserves all structure)
+DEFAULT_OUTPUT_FORMAT = os.getenv("OUTPUT_FORMAT", "excel")
+
+# ── Whitespace/Spacing handling ───────────────────────────────────────────
+# Preserve newlines in cells (for multi-line values)
+PRESERVE_NEWLINES = True
+
+# Normalize multiple spaces to single space
+NORMALIZE_SPACES = True
+
+# Minimum word spacing (in pixels) to consider as separate cells
+MIN_WORD_SPACING = 5
+
+# Maximum consecutive spaces to preserve (avoids alignment issues)
+MAX_CONSECUTIVE_SPACES = 3
+

@@ -1,20 +1,16 @@
 """
-PDF → Excel Converter — Streamlit Application
+PDF → Excel Converter — Enterprise-Grade Streamlit Application
 
-A production-grade tool for converting complex financial PDF tables
-into structured Excel spreadsheets with zero data loss.
+Clean, single-page design for converting PDF tables to multiple formats.
 """
 
 from __future__ import annotations
 
 import logging
 import sys
-import tempfile
 import time
-from io import BytesIO
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 import base64
 
@@ -26,10 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from backend.config import OUTPUT_DIR, UPLOAD_DIR
 from backend.extractor.pdf_engine import PDFExtractor
 from backend.extractor.table_reconstructor import TableReconstructor
-from backend.extractor.excel_writer import ExcelWriter
-from backend.models import ExtractionResult
+from backend.extractor.output_formatter import OutputFormatter
 
-# ── Logging setup ─────────────────────────────────────────────────────────
+# ── Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(name)s │ %(levelname)s │ %(message)s",
@@ -37,22 +32,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Helper functions
-# ══════════════════════════════════════════════════════════════════════════
-
 def get_base64_image(image_path):
+    """Convert image to base64 for embedding."""
     with open(image_path, "rb") as img_file:
         return base64.b64encode(img_file.read()).decode()
 
+
 # ══════════════════════════════════════════════════════════════════════════
-#  Page configuration & custom CSS
+#  Page Configuration
 # ══════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Drag-n-fly | Bajaj Life",
-    page_icon="✈️",
-    layout="centered",
+    page_title="Bajaj Life | PDF to Excel Converter",
+    page_icon="📄",
+    layout="wide",
     initial_sidebar_state="collapsed",
 )
 
@@ -65,118 +58,267 @@ if 'output_path' not in st.session_state:
     st.session_state.output_path = None
 if 'elapsed_time' not in st.session_state:
     st.session_state.elapsed_time = 0
+if 'selected_format' not in st.session_state:
+    st.session_state.selected_format = "excel"
 
-# Custom CSS for a high-end production look (Compact)
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CSS Styling - Clean Enterprise Design
+# ══════════════════════════════════════════════════════════════════════════
+
 st.markdown(
     """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
 
-    /* ── Global Styles ────────────────────────────────── */
-    html, body, [class*="css"] {
+    * {
         font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
-        overflow: hidden !important; /* Prevent scrolling */
+    }
+
+    html, body, [class*="css"] {
+        scroll-behavior: auto;
     }
 
     .stApp {
-        background-color: #FFFFFF;
-        background-image: radial-gradient(at 0% 0%, rgba(37, 99, 235, 0.02) 0, transparent 50%), 
-                          radial-gradient(at 50% 0%, rgba(37, 99, 235, 0.03) 0, transparent 50%);
-        height: 100vh;
+        background: linear-gradient(135deg, #FFFFFF 0%, #F9FAFB 100%);
     }
 
-    /* ── Header Branding ─────────────────────────────── */
-    .brand-container {
+    /* Hide default streamlit elements */
+    #MainMenu, footer, header { 
+        visibility: hidden; 
+    }
+
+    /* Header */
+    .header-container {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1.25rem 2rem;
+        border-bottom: 1px solid #E5E7EB;
+        background: white;
+        margin-bottom: 2rem;
+    }
+
+    .logo-section {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .logo-img {
+        height: 45px;
+        object-fit: contain;
+    }
+
+    .title-section {
         display: flex;
         flex-direction: column;
-        align-items: center;
-        text-align: center;
-        padding-top: 0.5rem;
-        margin-bottom: 1rem;
+        gap: 0.25rem;
     }
 
-    .brand-title {
-        font-size: 2.8rem;
-        font-weight: 800;
-        background: linear-gradient(90deg, #003399 0%, #0055ff 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-top: -8px;
-        letter-spacing: -0.04em;
+    .main-title {
+        font-size: 1.25rem;
+        font-weight: 700;
+        color: #1F2937;
+        margin: 0;
     }
 
-    .brand-subtext {
-        color: #64748B;
-        font-size: 0.8rem;
+    .sub-title {
+        font-size: 0.7rem;
+        color: #6B7280;
         font-weight: 500;
         text-transform: uppercase;
-        letter-spacing: 0.1em;
-        margin-top: -4px;
+        letter-spacing: 0.05em;
+        margin: 0;
     }
 
-    /* ── Upload Box ──────────────────────────────────── */
-    .upload-container {
-        background: #F8FAFC;
-        border: 2px dashed #E2E8F0;
-        border-radius: 20px;
-        padding: 1.5rem 1rem;
+    .format-selector-box {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        background: #F3F4F6;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        border: 1px solid #D1D5DB;
+    }
+
+    .format-label {
+        font-size: 0.7rem;
+        color: #6B7280;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin: 0;
+        white-space: nowrap;
+    }
+
+    /* Main Content Area */
+    .main-container {
+        padding: 0 2rem 2rem 2rem;
+        max-width: 1000px;
+        margin: 0 auto;
+    }
+
+    /* Upload Box */
+    .upload-box {
+        background: #F3F4F6;
+        border: 2px dashed #D1D5DB;
+        border-radius: 12px;
+        padding: 3rem 2rem;
         text-align: center;
         transition: all 0.3s ease;
+        margin-bottom: 2rem;
+        min-height: 280px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+    }
+
+    .upload-box:hover {
+        border-color: #3B82F6;
+        background: #F0F9FF;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.1);
+    }
+
+    .upload-title {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: #1F2937;
+        margin-bottom: 0.75rem;
+    }
+
+    .upload-description {
+        font-size: 0.875rem;
+        color: #6B7280;
+        margin-bottom: 1rem;
+        line-height: 1.5;
+    }
+
+    .upload-info {
+        font-size: 0.75rem;
+        color: #9CA3AF;
+        font-weight: 500;
+    }
+
+    /* Results Box */
+    .results-box {
+        background: linear-gradient(135deg, #F0F9FF 0%, #E0F2FE 100%);
+        border: 1px solid #BAE6FD;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .results-title {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #0C4A6E;
+        margin-bottom: 1rem;
+        margin-top: 0;
+    }
+
+    .metrics-row {
+        display: flex;
+        gap: 1.5rem;
         margin-bottom: 1rem;
     }
 
-    /* ── Action Buttons ───────────────────────────────── */
-    .stDownloadButton > button, .stButton > button {
-        width: 100% !important;
-        background: #003399 !important;
+    .metric-item {
+        flex: 1;
+        background: white;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        border: 1px solid #E5E7EB;
+        text-align: center;
+    }
+
+    .metric-label {
+        font-size: 0.75rem;
+        color: #6B7280;
+        font-weight: 600;
+        text-transform: uppercase;
+        margin-bottom: 0.5rem;
+    }
+
+    .metric-value {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: #1F2937;
+    }
+
+    /* Buttons */
+    .stButton > button, .stDownloadButton > button {
+        background: linear-gradient(135deg, #3B82F6 0%, #2563EB 100%) !important;
         color: white !important;
         border: none !important;
-        border-radius: 12px !important;
-        padding: 0.8rem !important;
+        border-radius: 8px !important;
+        padding: 0.75rem 1.5rem !important;
         font-weight: 600 !important;
-        font-size: 1rem !important;
-        box-shadow: 0 4px 6px -1px rgba(0, 51, 153, 0.2) !important;
+        font-size: 0.875rem !important;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25) !important;
         transition: all 0.2s ease !important;
+        width: 100% !important;
     }
 
-    .stButton > button:hover {
-        background: #002266 !important;
-        transform: translateY(-1px);
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
+        transform: translateY(-2px) !important;
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.35) !important;
     }
 
-    /* ── Metric Cards ─────────────────────────────────── */
-    [data-testid="stMetric"] {
-        background: #F8FAFC;
-        border: 1px solid #F1F5F9;
-        padding: 0.75rem;
-        border-radius: 12px;
-    }
-    
-    [data-testid="stMetricLabel"] {
-        font-size: 0.75rem !important;
-    }
-    
-    [data-testid="metric-container"] > div {
-        font-size: 1.25rem !important;
+    /* Info boxes */
+    .stInfo {
+        background-color: #F0F9FF !important;
+        border-left: 4px solid #0EA5E9 !important;
+        padding: 0.75rem 1rem !important;
+        border-radius: 8px !important;
+        font-size: 0.875rem !important;
     }
 
-    /* ── Footer ───────────────────────────────────────── */
-    .footer-minimal {
+    .stError {
+        background-color: #FEF2F2 !important;
+        border-left: 4px solid #EF4444 !important;
+        padding: 0.75rem 1rem !important;
+        border-radius: 8px !important;
+    }
+
+    /* Select dropdown styling */
+    .stSelectbox > div > div {
+        background: white !important;
+        border: 1px solid #D1D5DB !important;
+        border-radius: 8px !important;
+    }
+
+    /* Progress bar */
+    .stProgress > div > div {
+        background: linear-gradient(90deg, #3B82F6 0%, #2563EB 100%);
+    }
+
+    /* Footer */
+    .footer-section {
         text-align: center;
-        color: #94A3B8;
+        color: #9CA3AF;
         font-size: 0.75rem;
-        margin-top: 1rem;
-        padding-top: 0.75rem;
-        border-top: 1px solid #F1F5F9;
+        padding: 1.5rem 2rem;
+        border-top: 1px solid #E5E7EB;
+        margin-top: 2rem;
     }
 
-    /* ── Streamlit overrides ────────────────────────────── */
+    /* File uploader custom styling */
+    [data-testid="stFileUploadDropzone"] {
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+    }
+
     .stFileUploader {
         margin-bottom: 0 !important;
     }
-    .stProgress { margin-top: 1rem; }
-    
-    #MainMenu, footer, header {visibility: hidden;}
+
+    [data-testid="fileUploadDropzone"] label {
+        cursor: pointer;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -184,149 +326,267 @@ st.markdown(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Header / Branding
+#  Header Section
 # ══════════════════════════════════════════════════════════════════════════
 
 logo_b64 = get_base64_image("bajaj-life-logo.png")
 
-st.markdown(
-    f"""
-    <div class="brand-container">
-        <img src="data:image/png;base64,{logo_b64}" width="180">
-        <div class="brand-title">Drag-n-fly</div>
-        <div class="brand-subtext">powered by Bajaj Life Gen AI Workbench</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+header_col1, header_col2 = st.columns([3, 1])
 
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Main Frame
-# ══════════════════════════════════════════════════════════════════════════
-
-main_container = st.container()
-
-with main_container:
-    uploaded_file = st.file_uploader(
-        "Upload PDF",
-        type=["pdf"],
-        label_visibility="collapsed",
+with header_col1:
+    st.markdown(
+        f"""
+        <div class="header-container">
+            <div class="logo-section">
+                <img src="data:image/png;base64,{logo_b64}" class="logo-img">
+                <div class="title-section">
+                    <div class="main-title">PDF to Excel</div>
+                    <div class="sub-title">Table Extraction Engine</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # Check if a new file is uploaded (reset state)
-    if uploaded_file:
-        if 'last_uploaded' not in st.session_state or st.session_state.last_uploaded != uploaded_file.name:
-            st.session_state.is_processed = False
-            st.session_state.last_uploaded = uploaded_file.name
-
-    if not uploaded_file:
-        st.markdown(
-            """
-            <div class="upload-container">
-                <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">📁</div>
-                <div style="font-size: 1rem; font-weight: 600; color: #1E293B;">Click or Drag PDF here</div>
-                <div style="color: #64748B; font-size: 0.75rem;">Optimized for Financial Statements</div>
+with header_col2:
+    st.markdown(
+        f"""
+        <div class="header-container" style="justify-content: flex-end; border: none;">
+            <div class="format-selector-box">
+                <span class="format-label">Format:</span>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    
-    # SHOW PROCESS BUTTON IF FILE UPLOADED BUT NOT PROCESSED
-    elif not st.session_state.is_processed:
-        st.markdown(f"<p style='text-align: center; color: #64748B; font-size: 0.85rem;'>Selected: <b>{uploaded_file.name}</b></p>", unsafe_allow_html=True)
-        
-        button_placeholder = st.empty()
-        if button_placeholder.button("🚀 Start Extraction"):
-            button_placeholder.empty() # Remove button immediately
-            
-            progress_bar = st.progress(0, text="Initializing Engine...")
-            status_text = st.empty()
-            start_time = time.time()
-            
-            pdf_bytes = uploaded_file.getvalue()
-            pdf_path = UPLOAD_DIR / uploaded_file.name
-            pdf_path.write_bytes(pdf_bytes)
-            
-            try:
-                def update_progress(current, total):
-                    pct = int((current / total) * 70) # First 70% for extraction
-                    progress_bar.progress(pct, text=f"🔍 Extracting Tables...")
-                    status_text.markdown(f"<p style='text-align: center; color: #003399; font-weight: 600; font-size: 0.9rem;'>Processing Page {current} of {total}</p>", unsafe_allow_html=True)
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    selected_format = st.selectbox(
+        "Output Format",
+        options=["excel", "csv", "json", "markdown"],
+        format_func=lambda x: {
+            "excel": "Excel (XLSX)",
+            "csv": "CSV (ZIP)",
+            "json": "JSON",
+            "markdown": "Markdown"
+        }[x],
+        label_visibility="collapsed",
+        key="format_select",
+    )
 
-                extractor = PDFExtractor(pdf_path)
-                result = extractor.extract(progress_callback=update_progress)
-                
-                status_text.markdown("<p style='text-align: center; color: #003399; font-weight: 600; font-size: 0.9rem;'>🔧 Reconstructing Structure...</p>", unsafe_allow_html=True)
-                progress_bar.progress(85, text="🔧 Reconstructing...")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Main Content
+# ══════════════════════════════════════════════════════════════════════════
+
+st.markdown('<div class="main-container">', unsafe_allow_html=True)
+
+# File Upload Section
+uploaded_file = st.file_uploader(
+    "Upload PDF file",
+    type=["pdf"],
+    label_visibility="collapsed",
+)
+
+if not uploaded_file:
+    st.markdown(
+        """
+        <div class="upload-box">
+            <div class="upload-title">Click or Drag PDF here</div>
+            <div class="upload-description">
+                Drop your PDF file to begin extraction. Supports financial statements,
+                invoices, reports, and complex tabular documents.
+            </div>
+            <div class="upload-info">
+                Limit 200MB per file • PDF only • All 3 extraction methods applied
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# Track uploaded file
+if uploaded_file:
+    if 'last_uploaded' not in st.session_state or st.session_state.last_uploaded != uploaded_file.name:
+        st.session_state.is_processed = False
+        st.session_state.last_uploaded = uploaded_file.name
+
+# File selected but not processed
+if uploaded_file and not st.session_state.is_processed:
+    st.markdown(
+        f"""
+        <div style='background: #F0F9FF; border-left: 4px solid #0EA5E9; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;'>
+            <div style='font-size: 0.875rem; color: #0C4A6E; font-weight: 600;'>
+                Selected File: <strong>{uploaded_file.name}</strong> ({uploaded_file.size / (1024*1024):.1f} MB)
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    if st.button("Extract Tables", use_container_width=True):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        start_time = time.time()
+        
+        pdf_bytes = uploaded_file.getvalue()
+        pdf_path = UPLOAD_DIR / uploaded_file.name
+        pdf_path.write_bytes(pdf_bytes)
+        
+        try:
+            def update_progress(current, total):
+                pct = int((current / total) * 70)
+                progress_bar.progress(pct)
+                status_text.markdown(
+                    f"<div style='text-align: center; color: #0EA5E9; font-size: 0.875rem; font-weight: 600;'>Processing page {current} of {total}...</div>",
+                    unsafe_allow_html=True
+                )
+
+            extractor = PDFExtractor(pdf_path)
+            result = extractor.extract(progress_callback=update_progress)
+            
+            progress_bar.progress(85)
+            status_text.markdown(
+                "<div style='text-align: center; color: #0EA5E9; font-size: 0.875rem; font-weight: 600;'>Reconstructing structure...</div>",
+                unsafe_allow_html=True
+            )
+            
+            if result.tables:
+                reconstructor = TableReconstructor()
+                result.tables = reconstructor.reconstruct(result.tables)
                 
                 if result.tables:
-                    reconstructor = TableReconstructor()
-                    result.tables = reconstructor.reconstruct(result.tables)
+                    progress_bar.progress(95)
                     
-                    if result.tables:
-                        progress_bar.progress(95, text="📊 Generating Excel...")
-                        output_path = OUTPUT_DIR / (pdf_path.stem + ".xlsx")
-                        writer = ExcelWriter()
-                        writer.write(result, output_path)
-                        
-                        st.session_state.extraction_result = result
-                        st.session_state.output_path = output_path
-                        st.session_state.is_processed = True
-                        st.session_state.elapsed_time = time.time() - start_time
-                        
-                progress_bar.progress(100, text="Success!")
-                time.sleep(0.5)
-                progress_bar.empty()
-                status_text.empty()
-                st.rerun() 
-                
-            except Exception as exc:
-                st.error(f"Error: {exc}")
-            finally:
-                if pdf_path.exists(): pdf_path.unlink()
+                    ext_map = {
+                        "excel": ".xlsx",
+                        "csv": ".zip",
+                        "json": ".json",
+                        "markdown": ".md"
+                    }
+                    output_ext = ext_map.get(selected_format, ".xlsx")
+                    output_path = OUTPUT_DIR / (pdf_path.stem + output_ext)
+                    
+                    formatter = OutputFormatter()
+                    output_path = formatter.write_format(result, output_path, selected_format)
+                    
+                    st.session_state.extraction_result = result
+                    st.session_state.output_path = output_path
+                    st.session_state.output_format = selected_format
+                    st.session_state.is_processed = True
+                    st.session_state.elapsed_time = time.time() - start_time
+                    
+            progress_bar.progress(100)
+            time.sleep(0.5)
+            progress_bar.empty()
+            status_text.empty()
+            st.rerun()
+            
+        except Exception as exc:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Extraction failed: {exc}")
+            logger.exception("Extraction failed")
+        finally:
+            if pdf_path.exists():
+                pdf_path.unlink()
 
-    # SHOW RESULTS IF PROCESSED
-    if st.session_state.is_processed and st.session_state.extraction_result:
-        result = st.session_state.extraction_result
-        output_path = st.session_state.output_path
+# Show results if processed
+if st.session_state.is_processed and st.session_state.extraction_result:
+    result = st.session_state.extraction_result
+    output_path = st.session_state.output_path
+    output_format = st.session_state.get('output_format', 'excel')
+    
+    st.markdown('<div class="results-box">', unsafe_allow_html=True)
+    st.markdown('<h3 class="results-title">Extraction Complete</h3>', unsafe_allow_html=True)
+    
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        tables_count = len([t for t in result.tables if not t.is_empty])
+        st.markdown(
+            f"""
+            <div class="metric-item">
+                <div class="metric-label">Tables Found</div>
+                <div class="metric-value">{tables_count}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+    with m2:
+        rows = sum(t.total_rows for t in result.tables if not t.is_empty)
+        st.markdown(
+            f"""
+            <div class="metric-item">
+                <div class="metric-label">Total Rows</div>
+                <div class="metric-value">{rows}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+    with m3:
+        if any(not t.is_empty for t in result.tables):
+            acc = sum(t.confidence for t in result.tables if not t.is_empty) / len([t for t in result.tables if not t.is_empty]) * 100
+            acc_text = f"{acc:.0f}%"
+        else:
+            acc_text = "N/A"
+        st.markdown(
+            f"""
+            <div class="metric-item">
+                <div class="metric-label">Accuracy</div>
+                <div class="metric-value">{acc_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    if output_path and output_path.exists():
+        mime_types = {
+            "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "csv": "application/zip",
+            "json": "application/json",
+            "markdown": "text/markdown"
+        }
+        mime_type = mime_types.get(output_format, "application/octet-stream")
         
-        # Results Container (Stable transition)
-        results_box = st.container()
-        with results_box:
-            st.markdown("<div style='background: #F0F9FF; border-radius: 16px; padding: 1.25rem; border: 1px solid #BAE6FD;'>", unsafe_allow_html=True)
-            
-            # Micro Summary
-            m1, m2, m3 = st.columns(3)
-            with m1: st.metric("Tables", len(result.tables))
-            with m2: 
-                rows = sum(t.total_rows for t in result.tables)
-                st.metric("Rows", rows)
-            with m3:
-                acc = sum(t.confidence for t in result.tables)/len(result.tables)*100 if result.tables else 0
-                st.metric("Accuracy", f"{acc:.0f}%")
+        with open(output_path, "rb") as f:
+            btn_data = f.read()
+        
+        st.download_button(
+            label=f"Download {output_path.name}",
+            data=btn_data,
+            file_name=output_path.name,
+            mime=mime_type,
+            use_container_width=True,
+        )
+        
+        if output_format == "csv":
+            st.info("Multiple CSV files packaged in ZIP - extract to access individual tables")
+        elif output_format == "json":
+            st.info("Structured JSON format - preserves all extraction metadata and table details")
+        elif output_format == "markdown":
+            st.info("Markdown format - readable in any text editor")
+        
+        st.markdown(
+            f"""
+            <div style='text-align: center; color: #6B7280; font-size: 0.75rem; margin-top: 1rem;'>
+                Extracted using hybrid method combining all 3 extraction engines • 
+                Completed in {st.session_state.elapsed_time:.1f}s
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
     
-            st.markdown("<br>", unsafe_allow_html=True)
-    
-            if output_path and output_path.exists():
-                with open(output_path, "rb") as f:
-                    btn_data = f.read()
-                st.download_button(
-                    label=f"📥 Download {output_path.name}",
-                    data=btn_data,
-                    file_name=output_path.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-                st.markdown(f"<p style='text-align: center; color: #64748B; font-size: 0.75rem; margin-top: 5px;'>Finished in {st.session_state.elapsed_time:.1f}s</p>", unsafe_allow_html=True)
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-            
-            if st.button("🔄 Reset / Process New File"):
-                st.session_state.is_processed = False
-                st.session_state.extraction_result = None
-                st.rerun()
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("Process Another File", use_container_width=True):
+        st.session_state.is_processed = False
+        st.session_state.extraction_result = None
+        st.rerun()
 
+st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Footer
@@ -334,8 +594,8 @@ with main_container:
 
 st.markdown(
     """
-    <div class="footer-minimal">
-        © 2026 Bajaj Life Insurance · Internal Gen AI Tool
+    <div class="footer-section">
+        © 2026 Bajaj Life Insurance • Gen AI Table Extraction Engine • Internal Use Only
     </div>
     """,
     unsafe_allow_html=True,
